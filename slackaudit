@@ -1,0 +1,901 @@
+#!/bin/bash
+# slackaudit - read-only local Slackware auditor
+
+VERSION="0.2.5"
+PROGRAM="slackaudit"
+export LC_ALL=C
+TMPDIR_AUDIT=""
+DIALOG_BIN="${DIALOG:-dialog}"
+REPORT_FILE=""
+FORCE=0
+PACKAGE_LOG_DIR="${SLACKAUDIT_PACKAGE_DIR:-/var/log/packages}"
+
+have() { command -v "$1" >/dev/null 2>&1; }
+cleanup() { [[ -n "$TMPDIR_AUDIT" && -d "$TMPDIR_AUDIT" ]] && rm -rf -- "$TMPDIR_AUDIT"; }
+trap cleanup EXIT HUP INT TERM
+
+usage() {
+    cat <<USAGE
+slackaudit $VERSION - local Slackware audit tool
+
+Usage:
+  slackaudit                 Open the dialog interface
+  slackaudit --report FILE   Write a complete text report
+  slackaudit --report FILE --force
+  slackaudit --help
+  slackaudit --version
+
+For the most complete results, run the interactive interface as root (for example, sudo slackaudit).
+
+This is a read-only audit. Package manifest checks only verify that files listed in
+/var/log/packages exist; they do not compare hashes
+or detect modified file contents. CVE analysis is not included.
+USAGE
+}
+
+while (($#)); do
+    case "$1" in
+        --report|-r) (($# >= 2)) || { usage >&2; exit 2; }; REPORT_FILE=$2; shift 2 ;;
+        --force|-f) FORCE=1; shift ;;
+        --help|-h) usage; exit 0 ;;
+        --version|-V) printf '%s %s\n' "$PROGRAM" "$VERSION"; exit 0 ;;
+        *) printf 'Unknown option: %s\n' "$1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+if [[ -z "$REPORT_FILE" ]] && ! have "$DIALOG_BIN"; then
+    printf 'slackaudit: dialog not found. Install dialog or use --report FILE.\n' >&2
+    exit 1
+fi
+TMPDIR_AUDIT=$(mktemp -d /tmp/slackaudit.XXXXXX) || exit 1
+chmod 700 "$TMPDIR_AUDIT"
+
+redact() {
+    sed -E \
+        -e '/(Serial Number|UUID|Asset Tag|Product Serial):/ s/:.*/: [redacted]/I' \
+        -e 's/([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}/[MAC redacted]/g'
+}
+print_cmd() {
+    local cmd=$1
+    shift
+    if have "$cmd"; then "$cmd" "$@" 2>&1 | redact
+    else printf '[unavailable: command %s is not installed]\n' "$cmd"
+    fi
+}
+section_title() {
+    printf '%s\n' "$1"
+    printf '%s\n' '========================================'
+    printf '\n'
+}
+
+system_overview() {
+    section_title "System overview"
+    printf 'Hostname: %s\n' "$(hostname 2>/dev/null || printf unknown)"
+    printf 'Slackware: '
+    if [[ -r /etc/slackware-version ]]; then cat /etc/slackware-version; else printf 'version not identified\n'; fi
+    printf 'Architecture: %s\n' "$(uname -m 2>/dev/null || printf unknown)"
+    printf 'Kernel: %s\n' "$(uname -r 2>/dev/null || printf unknown)"
+    printf 'Collection time: %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z' 2>/dev/null || date)"
+    if have uptime; then printf 'Uptime: '; uptime -p 2>/dev/null || uptime; fi
+    if [[ -d /sys/firmware/efi ]]; then printf 'Firmware: UEFI\n'
+    else printf 'Firmware: BIOS/Legacy or UEFI variables unavailable\n'; fi
+    if [[ $EUID -eq 0 ]]; then printf 'Privileges: root\n'
+    else printf 'Privileges: unprivileged; some data may be limited\n'; fi
+    printf '\n'
+    section_title "Resources"
+    print_cmd free -h
+    printf '\n'
+    print_cmd df -hT /
+}
+
+hardware_cpu() {
+    local lscpu_file="$TMPDIR_AUDIT/lscpu-cpu.out"
+    section_title "CPU details"
+    if have lscpu && lscpu > "$lscpu_file" 2>&1 && grep -q '^Architecture:' "$lscpu_file"; then
+        awk -F: '
+            BEGIN { IGNORECASE=0 }
+            /^[[:space:]]*(Architecture|CPU\(s\)|On-line CPU\(s\) list|Vendor ID|Model name|CPU family|Model|Stepping|CPU MHz|CPU max MHz|CPU min MHz|BogoMIPS|Virtualization|Hypervisor vendor|Virtualization type|L[1-9][di] cache|NUMA node\(s\)|Flags):/ {print}
+        ' "$lscpu_file" | redact
+    elif [[ -r /proc/cpuinfo ]]; then
+        printf 'lscpu is unavailable or incomplete; showing CPU fields from /proc/cpuinfo.\n'
+        awk -F: '/^(vendor_id|cpu family|model|model name|stepping|cpu MHz|bogomips|flags|Features|Hardware|Processor)[[:space:]]*:/ {sub(/^[[:space:]]*/, "", $2); print $1 ": " $2}' /proc/cpuinfo | awk '!seen[$0]++' | redact
+    else
+        printf 'CPU details are unavailable.\n'
+    fi
+    printf '\nLogical processors: '
+    if have nproc; then nproc
+    elif [[ -r /proc/cpuinfo ]]; then grep -c '^processor[[:space:]]*:' /proc/cpuinfo 2>/dev/null || printf 'unavailable\n'
+    else printf 'unavailable\n'; fi
+}
+
+hardware_pci() {
+    section_title "PCI devices and drivers"
+    if have lspci; then lspci -nnk 2>&1 | redact
+    elif [[ -d /sys/bus/pci/devices ]]; then
+        for d in /sys/bus/pci/devices/*; do
+            [[ -e "$d" ]] || continue
+            printf '%s vendor=%s device=%s class=%s driver=%s\n' \
+                "$(basename "$d")" "$(cat "$d/vendor" 2>/dev/null)" "$(cat "$d/device" 2>/dev/null)" \
+                "$(cat "$d/class" 2>/dev/null)" "$(basename "$(readlink "$d/driver" 2>/dev/null)" 2>/dev/null)"
+        done
+    else printf 'PCI information unavailable.\n'; fi
+}
+
+hardware_memory() {
+    section_title "Memory"
+    print_cmd free -h
+    if [[ -r /proc/meminfo ]]; then printf '\n/proc/meminfo:\n'; cat /proc/meminfo; fi
+    printf '\nMemory modules (optional: dmidecode):\n'
+    if have dmidecode && [[ $EUID -eq 0 ]]; then dmidecode -t memory 2>&1 | redact
+    elif have dmidecode; then printf 'Run as root to query memory-module details.\n'
+    else printf 'dmidecode is not installed.\n'; fi
+}
+
+hardware_board() {
+    section_title "Motherboard and firmware"
+    if have dmidecode && [[ $EUID -eq 0 ]]; then dmidecode -t system -t baseboard -t bios 2>&1 | redact
+    elif have dmidecode; then printf 'Run as root to query SMBIOS details.\n'
+    else printf 'dmidecode is not installed.\n'; fi
+}
+
+hardware_graphics() {
+    section_title "Graphics controllers"
+    if have lspci; then lspci -nnk | grep -i -E -A4 'VGA compatible|3D controller|Display controller' | redact || printf 'No graphics controller listed.\n'
+    else printf 'Install pciutils to identify graphics controllers.\n'; fi
+}
+hardware_audio() {
+    section_title "Audio devices"
+    if have aplay; then aplay -l 2>&1 | redact; else printf 'alsa-utils (aplay) is not installed.\n'; fi
+    if have lspci; then printf '\nPCI audio devices:\n'; lspci -nnk | grep -i -E -A4 'Audio device|Multimedia audio' | redact || true; fi
+}
+hardware_input() {
+    section_title "Input devices"
+    if have libinput; then libinput list-devices 2>&1 | redact
+    elif have lsinput; then lsinput 2>&1 | redact
+    else printf 'Install libinput (or a package providing lsinput) for detailed device information.\n'; fi
+    if [[ -r /proc/bus/input/devices ]]; then printf '\nKernel input-device list:\n'; cat /proc/bus/input/devices | redact; fi
+}
+hardware_sensors() {
+    section_title "Hardware sensors"
+    if have sensors; then sensors 2>&1 | redact
+    else printf 'lm_sensors is not installed or sensors are not configured.\n'; fi
+}
+
+hardware_modules() {
+    section_title "Loaded kernel modules"
+    if have lsmod; then
+        lsmod 2>&1 | redact
+    elif [[ -r /proc/modules ]]; then
+        printf 'lsmod is unavailable; reading /proc/modules.\n'
+        printf 'Module                 Size  Used by\n'
+        awk '{printf "%-22s %8s %4s %s\n", $1, $2, $3, $4}' /proc/modules | redact
+    else
+        printf 'Loaded module information is unavailable.\n'
+    fi
+    if [[ -r /proc/sys/kernel/modules_disabled ]]; then
+        printf '\nModule loading disabled: '
+        case "$(cat /proc/sys/kernel/modules_disabled 2>/dev/null)" in
+            1) printf 'yes\n' ;; 0) printf 'no\n' ;; *) printf 'unknown\n' ;;
+        esac
+    fi
+}
+
+hardware_usb() {
+    section_title "USB devices"
+    if have lsusb; then
+        printf 'Bus tree and speed:\n'; lsusb -t 2>&1 | redact
+        printf '\nDevices:\n'; lsusb 2>&1 | redact
+    elif [[ -d /sys/bus/usb/devices ]]; then
+        for d in /sys/bus/usb/devices/*; do
+            [[ -r "$d/idVendor" ]] || continue
+            printf '%s %s:%s %s %s\n' "$(basename "$d")" "$(cat "$d/idVendor")" "$(cat "$d/idProduct")" \
+                "$(cat "$d/manufacturer" 2>/dev/null)" "$(cat "$d/product" 2>/dev/null)"
+        done
+    else printf 'USB information unavailable.\n'; fi
+}
+
+hardware_storage() {
+    local lsblk_file="$TMPDIR_AUDIT/lsblk.out"
+    section_title "Disks and partitions"
+    if have lsblk; then
+        if lsblk -e 7 -o NAME,TYPE,SIZE,FSTYPE,LABEL,UUID,MODEL > "$lsblk_file" 2>&1; then
+            redact < "$lsblk_file"
+        else
+            printf 'lsblk failed; falling back to /proc/partitions. Diagnostic:\n'
+            sed -n '1,5p' "$lsblk_file" | redact
+            if [[ -r /proc/partitions ]]; then cat /proc/partitions; else printf 'Partition table information unavailable.\n'; fi
+        fi
+    elif [[ -r /proc/partitions ]]; then
+        printf 'lsblk is not installed; showing kernel partition records.\n'
+        cat /proc/partitions
+    else
+        printf 'Disk and partition information is unavailable.\n'
+    fi
+    printf '\nMount points are listed separately in the Mounted filesystems screen.\n'
+}
+
+hardware_graphics_audio_input() {
+    section_title "Graphics"
+    if have lspci; then lspci -nnk 2>/dev/null | grep -i -E -A3 'VGA compatible|3D controller|Display controller' | redact || printf 'No graphics controller listed.\n'
+    else printf 'Install pciutils to identify PCI controllers.\n'; fi
+    printf '\n'
+    section_title "Audio"
+    if have aplay; then aplay -l 2>&1 | redact; else printf 'aplay is not installed.\n'; fi
+    if have lspci; then lspci -nnk 2>/dev/null | grep -i -E -A3 'Audio device|Multimedia audio' | redact || true; fi
+    printf '\n'
+    section_title "Input devices"
+    if have libinput; then libinput list-devices 2>&1 | redact
+    elif have lsinput; then lsinput 2>&1 | redact
+    else printf 'libinput/lsinput is not installed; detailed device list is unavailable.\n'; fi
+    printf '\n'
+    section_title "Sensors"
+    if have sensors; then sensors 2>&1 | redact
+    else printf 'lm_sensors is not installed or sensors are not configured.\n'; fi
+}
+
+hardware_network() {
+    section_title "Network adapters"
+    if have lspci; then lspci -nnk 2>/dev/null | grep -i -E -A3 'Ethernet controller|Network controller|Wireless' | redact || true; fi
+    printf '\nInterfaces and addresses:\n'
+    if have ip; then ip -brief address 2>&1 | redact; else printf 'iproute2 is not installed.\n'; fi
+    printf '\nRoutes:\n'
+    if have ip; then ip route 2>&1 | redact; fi
+    printf '\nWi-Fi:\n'
+    if have iw; then iw dev 2>&1 | redact; else printf 'iw is not installed.\n'; fi
+}
+hardware_all() {
+    hardware_cpu; hardware_memory; hardware_board; hardware_modules
+    hardware_pci; hardware_usb; hardware_storage
+    hardware_graphics_audio_input; hardware_network
+}
+
+audit_summary() {
+    local f name base count=0 dupcount=0 rc_enabled=0 used="" dmesg_file="$TMPDIR_AUDIT/summary-dmesg"
+    local dupfile="$TMPDIR_AUDIT/summary-duplicates"
+    : > "$dupfile"
+    section_title "Local audit summary"
+    printf 'System: %s | architecture: %s | kernel: %s\n' \
+        "$(cat /etc/slackware-version 2>/dev/null || printf unknown)" \
+        "$(uname -m 2>/dev/null || printf unknown)" "$(uname -r 2>/dev/null || printf unknown)"
+    if [[ $EUID -eq 0 ]]; then printf 'Access: OK - running as root.\n'
+    else printf 'Access: LIMITED - unprivileged; some checks may be incomplete.\n'; fi
+
+    if [[ -d "$PACKAGE_LOG_DIR" ]]; then
+        shopt -s nullglob
+        local pkgs=("$PACKAGE_LOG_DIR"/*)
+        shopt -u nullglob
+        for f in "${pkgs[@]}"; do
+            [[ -f "$f" ]] || continue
+            name=$(sed -n 's/^PACKAGE NAME: //p' "$f" | head -n 1)
+            [[ -n "$name" ]] || name=$(basename "$f")
+            base=$(printf '%s\n' "$name" | sed -E 's/-[^-]+-[^-]+-[^-]+$//')
+            printf '%s\n' "$base" >> "$dupfile"
+            ((count+=1))
+        done
+        dupcount=$(sort "$dupfile" | uniq -d | wc -l)
+        printf 'Registered packages: %s\n' "$count"
+        if ((dupcount)); then printf 'Duplicate package names: ATTENTION - %s name(s).\n' "$dupcount"
+        else printf 'Duplicate package names: OK - none found.\n'; fi
+    else printf 'Packages: ATTENTION - package database directory not found: %s\n' "$PACKAGE_LOG_DIR"; fi
+
+    if have findmnt && [[ -r /etc/fstab ]]; then
+        if findmnt --verify --tab-file /etc/fstab >/dev/null 2>&1; then
+            printf '/etc/fstab: OK - structural check passed.\n'
+        else
+            printf '/etc/fstab: ATTENTION - findmnt reported issues; see the storage section.\n'
+        fi
+    else printf '/etc/fstab: NOT CHECKED - findmnt or the file is unavailable.\n'; fi
+
+    if have df; then
+        used=$(df -P / 2>/dev/null | awk 'NR==2 {gsub(/%/, "", $5); print $5}')
+        if [[ "$used" =~ ^[0-9]+$ ]]; then
+            if ((used >= 95)); then printf 'Root filesystem usage: FAIL - %s%% used.\n' "$used"
+            elif ((used >= 85)); then printf 'Root filesystem usage: ATTENTION - %s%% used.\n' "$used"
+            else printf 'Root filesystem usage: OK - %s%% used.\n' "$used"; fi
+        else printf 'Root filesystem usage: NOT CHECKED.\n'; fi
+    fi
+
+    if [[ -d /etc/rc.d ]]; then
+        for f in /etc/rc.d/rc.*; do [[ -f "$f" && -x "$f" ]] && ((rc_enabled+=1)); done
+        printf 'Enabled rc scripts: %s (review whether each is needed).\n' "$rc_enabled"
+    fi
+    if have dmesg; then
+        if dmesg > "$dmesg_file" 2>&1; then
+            count=$(grep -i -E 'error|failed|failure|firmware.*(missing|not found)|timeout|I/O error|Call Trace' "$dmesg_file" | wc -l)
+            if ((count)); then printf 'Kernel messages to review: ATTENTION - %s matching line(s) in the current buffer.\n' "$count"
+            else printf 'Kernel messages: OK - no matching error pattern in the current buffer.\n'; fi
+        else
+            printf 'Kernel messages: NOT CHECKED - dmesg access failed.\n'
+            sed -n '1,3p' "$dmesg_file"
+        fi
+    else printf 'Kernel messages: NOT CHECKED - dmesg is not installed.\n'; fi
+    printf '\nThis summary uses simple local checks; it does not assign an overall score or scan CVEs.\n'
+}
+
+package_audit() {
+    local f n base total=0 checked=0 missing=0
+    local dupfile="$TMPDIR_AUDIT/duplicates" missingfile="$TMPDIR_AUDIT/missing"
+    : > "$dupfile"; : > "$missingfile"
+    section_title "Installed packages"
+    if [[ ! -d "$PACKAGE_LOG_DIR" ]]; then printf 'Package database directory not found: %s\n' "$PACKAGE_LOG_DIR"; return; fi
+    shopt -s nullglob
+    local files=("$PACKAGE_LOG_DIR"/*)
+    shopt -u nullglob
+    printf 'Package records: %s\n' "${#files[@]}"
+    for f in "${files[@]}"; do
+        [[ -f "$f" ]] || continue
+        n=$(sed -n 's/^PACKAGE NAME: //p' "$f" | head -n 1)
+        [[ -n "$n" ]] || n=$(basename "$f")
+        base=$(printf '%s\n' "$n" | sed -E 's/-[^-]+-[^-]+-[^-]+$//')
+        printf '%s\n' "$base" >> "$dupfile"
+        ((total+=1))
+    done
+    printf 'Package names with multiple installed versions:\n'
+    if sort "$dupfile" | uniq -d | grep .; then :; else printf 'None found.\n'; fi
+    printf '\nPresence of files listed in package manifests:\n'
+    printf 'This check does not compare file contents or hashes.\n'
+    for f in "${files[@]}"; do
+        [[ -f "$f" ]] || continue
+        while IFS= read -r n; do
+            [[ -n "$n" ]] || continue
+            [[ "$n" == install/* || "$n" == ./install/* ]] && continue
+            case "$n" in ./*) n=${n#./} ;; esac
+            [[ "$n" == /* ]] || n="/$n"
+            ((checked+=1))
+            if [[ ! -e "$n" && ! -L "$n" ]]; then
+                ((missing+=1))
+                if ((missing <= 100)); then printf '%s: %s\n' "$(basename "$f")" "$n" >> "$missingfile"; fi
+            fi
+        done < <(awk 'BEGIN{list=0} /^FILE LIST:/{list=1; next} list{print}' "$f")
+    done
+    printf 'Entries checked: %s\nMissing files: %s\n' "$checked" "$missing"
+    if ((missing)); then printf 'First missing paths (maximum 100):\n'; cat "$missingfile"; fi
+    printf '\nPackage records are stored in %s.\n' "$PACKAGE_LOG_DIR"
+    printf 'The tool does not automatically classify packages as official or third-party.\n'
+}
+
+storage_audit() {
+    section_title "Storage and filesystems"
+    hardware_storage
+    storage_mounts
+    printf '\n/etc/fstab check:\n'
+    if have findmnt; then findmnt --verify --verbose --tab-file /etc/fstab 2>&1 | redact
+    else printf 'findmnt is unavailable; review devices and UUIDs manually.\n'; fi
+    printf '\nDisk usage:\n'; print_cmd df -hT
+    printf '\nInodes:\n'; print_cmd df -hi
+    storage_smart
+}
+
+boot_audit() {
+    section_title "Running kernel"
+    printf 'uname -a: '; uname -a
+    printf '\nKernel command line:\n'
+    if [[ -r /proc/cmdline ]]; then cat /proc/cmdline | redact; else printf 'unavailable\n'; fi
+    printf '\nFiles in /boot:\n'
+    if [[ -d /boot ]]; then ls -lah /boot 2>&1 | redact; else printf '/boot not found.\n'; fi
+    printf '\n'
+    boot_loader
+    if [[ -d /sys/firmware/efi ]]; then printf '\n'; boot_uefi; fi
+}
+
+network_audit() {
+    section_title "Network"
+    printf 'Interfaces and addresses:\n'
+    if have ip; then ip -brief address 2>&1 | redact; else printf 'iproute2 is not installed.\n'; fi
+    printf '\nRoutes:\n'; if have ip; then ip route 2>&1 | redact; fi
+    printf '\nConfigured DNS:\n'
+    if [[ -r /etc/resolv.conf ]]; then cat /etc/resolv.conf | redact; else printf '/etc/resolv.conf unavailable.\n'; fi
+    printf '\nNetworkManager:\n'
+    if have nmcli; then nmcli general status 2>&1 | redact; nmcli device status 2>&1 | redact
+    else printf 'nmcli is not installed.\n'; fi
+    printf '\nListening sockets:\n'
+    if have ss; then ss -lntup 2>&1 | redact
+    elif have netstat; then netstat -lntup 2>&1 | redact
+    else printf 'ss/netstat unavailable.\n'; fi
+}
+
+services_audit() {
+    local f
+    section_title "Slackware startup services"
+    printf 'Executable scripts in /etc/rc.d (executable bit = enabled):\n'
+    if [[ -d /etc/rc.d ]]; then
+        for f in /etc/rc.d/rc.*; do
+            [[ -f "$f" ]] || continue
+            if [[ -x "$f" ]]; then printf 'enabled      %s\n' "$f"; else printf 'disabled     %s\n' "$f"; fi
+        done
+    else printf '/etc/rc.d not found.\n'; fi
+    printf '\nProcesses (short list):\n'
+    if have ps; then ps -eo pid,comm,args --sort=comm 2>&1 | head -n 100 | redact
+    else printf 'ps is unavailable.\n'; fi
+    printf '\nListening sockets:\n'
+    if have ss; then ss -lntup 2>&1 | redact; else printf 'ss is unavailable.\n'; fi
+}
+
+security_audit() {
+    local f
+    section_title "Local accounts"
+    if [[ -r /etc/passwd ]]; then
+        awk -F: '$3==0 || $3>=1000 {printf "%-20s uid=%-6s gid=%-6s home=%s shell=%s\n",$1,$3,$4,$6,$7}' /etc/passwd
+    fi
+    printf '\nRelevant administrative groups:\n'
+    if [[ -r /etc/group ]]; then grep -E '^(wheel|sudo|root):' /etc/group || printf 'No matching groups found.\n'; fi
+    printf '\nPermissions of sensitive files:\n'
+    for f in /etc/passwd /etc/shadow /etc/group /etc/sudoers /etc/ssh/sshd_config; do
+        [[ -e "$f" ]] || continue
+        stat -c '%A %a %U:%G %n' "$f" 2>&1
+    done
+    printf '\n'
+    security_ssh
+    printf '\nFirewall:\n'
+    if have nft; then nft list ruleset 2>&1 | head -n 160 | redact
+    elif have iptables; then iptables -S 2>&1 | redact
+    else printf 'nftables/iptables unavailable.\n'; fi
+    printf '\nLocal configuration checks only; CVE analysis is not included.\n'
+}
+
+logs_audit() {
+    section_title "Categorized log review"
+    printf 'Kernel message categories:\n'
+    logs_kernel
+    printf '\nSystem log categories:\n'
+    logs_files
+    printf '\nCategories are heuristic text matches; review context before drawing conclusions.\n'
+}
+
+# Topic-level views used by the interactive submenus.
+package_summary() {
+    section_title "Installed package summary"
+    if [[ ! -d "$PACKAGE_LOG_DIR" ]]; then printf 'Package database directory not found: %s\n' "$PACKAGE_LOG_DIR"; return; fi
+    local f n base count=0
+    local list="$TMPDIR_AUDIT/pkg-names"
+    : > "$list"
+    shopt -s nullglob; local files=("$PACKAGE_LOG_DIR"/*); shopt -u nullglob
+    printf 'Package records: %s\n' "${#files[@]}"
+    for f in "${files[@]}"; do
+        [[ -f "$f" ]] || continue
+        n=$(sed -n 's/^PACKAGE NAME: //p' "$f" | head -n 1); [[ -n "$n" ]] || n=$(basename "$f")
+        base=$(printf '%s\n' "$n" | sed -E 's/-[^-]+-[^-]+-[^-]+$//'); printf '%s\n' "$base" >> "$list"
+    done
+    printf '\nPackage names with multiple installed versions:\n'
+    if sort "$list" | uniq -d | grep .; then :; else printf 'None found.\n'; fi
+}
+package_third_party() {
+    section_title "Likely third-party packages"
+    if [[ ! -d "$PACKAGE_LOG_DIR" ]]; then printf 'Package database directory not found: %s\n' "$PACKAGE_LOG_DIR"; return; fi
+    local f n build lower count=0 list="$TMPDIR_AUDIT/third-party-packages"
+    : > "$list"
+    shopt -s nullglob; local files=("$PACKAGE_LOG_DIR"/*); shopt -u nullglob
+    for f in "${files[@]}"; do
+        [[ -f "$f" ]] || continue
+        n=$(sed -n 's/^PACKAGE NAME: //p' "$f" | head -n 1)
+        [[ -n "$n" ]] || n=$(basename "$f")
+        # Community repositories commonly mark packages with a maintainer or
+        # repository tag in the build field (for example, _SBo or alien).
+        if [[ "$n" =~ ^(.+)-[^-]+-[^-]+-([^-]+)$ ]]; then
+            build=${BASH_REMATCH[2]}
+            lower=${build,,}
+            case "$lower" in
+                *sbo*|*slackbuild*|*alien*|*ponce*|*restricted*|*slackonly*|*slackpkgplus*|*rlw*|*ktown*|*msb*|*gds*)
+                    printf '%s\n' "$n" >> "$list"
+                    ((count+=1))
+                    ;;
+            esac
+        fi
+    done
+    printf 'Likely third-party packages found: %s\n\n' "$count"
+    if ((count)); then sort -f "$list"; else printf 'No package records with recognized third-party build tags were found.\n'; fi
+    printf '\nClassification uses recognizable repository or maintainer tags in package build names. Untagged local or third-party packages may not be detected; this list is indicative, not a complete provenance database.\n'
+}
+package_list() {
+    section_title "Complete installed package list"
+    if [[ ! -d "$PACKAGE_LOG_DIR" ]]; then printf 'Package database directory not found: %s\n' "$PACKAGE_LOG_DIR"; return; fi
+    local f name list="$TMPDIR_AUDIT/installed-packages.sorted"
+    : > "$list"
+    shopt -s nullglob
+    local files=("$PACKAGE_LOG_DIR"/*)
+    shopt -u nullglob
+    for f in "${files[@]}"; do
+        [[ -f "$f" ]] || continue
+        name=$(sed -n 's/^PACKAGE NAME: //p' "$f" | head -n 1)
+        [[ -n "$name" ]] || name=$(basename "$f")
+        printf '%s\n' "$name" >> "$list"
+    done
+    if [[ ! -s "$list" ]]; then
+        printf 'No package records found in %s.\n' "$PACKAGE_LOG_DIR"
+        return
+    fi
+    printf 'Installed package records: %s\n\n' "$(wc -l < "$list" | tr -d ' ')"
+    sort -f "$list"
+}
+requirement_check() {
+    local package=$1 purpose=$2 cmd missing=""
+    shift 2
+    for cmd in "$@"; do
+        have "$cmd" || missing+=" $cmd"
+    done
+    if [[ -z "$missing" ]]; then
+        printf '[available] %-18s %s\n' "$package" "$purpose"
+    else
+        printf '[install %-18s] %s (missing command:%s)\n' "$package" "$purpose" "$missing"
+    fi
+}
+requirement_any_check() {
+    local package=$1 purpose=$2 cmd
+    shift 2
+    for cmd in "$@"; do
+        if have "$cmd"; then
+            printf '[available] %-18s %s (%s)\n' "$package" "$purpose" "$cmd"
+            return
+        fi
+    done
+    printf '[install %-18s] %s (missing commands:' "$package" "$purpose"
+    printf ' %s' "$@"
+    printf ')\n'
+}
+requirement_optional_check() {
+    local package=$1 purpose=$2 cmd
+    shift 2
+    for cmd in "$@"; do
+        if have "$cmd"; then
+            printf '[available] %-18s %s (%s)\n' "$package" "$purpose" "$cmd"
+            return
+        fi
+    done
+    printf '[optional %-18s] %s (missing command:' "$package" "$purpose"
+    printf ' %s' "$@"
+    printf ')\n'
+}
+requirements_audit() {
+    section_title "Tools and package recommendations"
+    printf 'Install only the missing packages for the features you want.\n'
+    printf 'The listed packages are Slackware package names.\n\n'
+    printf 'Core script and interactive interface:\n'
+    requirement_check "bash" "script interpreter" bash
+    requirement_check "coreutils" "basic system commands" date uname df stat basename mktemp chmod timeout
+    requirement_check "hostname" "system hostname command" hostname
+    requirement_check "gawk" "manifest and system-data parsing" gawk
+    requirement_check "grep" "text filtering" grep
+    requirement_check "sed" "text parsing and redaction" sed
+    requirement_optional_check "dialog" "interactive menus; not needed for --report" dialog
+    printf '\nSystem inventory and network:\n'
+    requirement_check "procps-ng" "memory, process, and uptime information" free ps uptime
+    requirement_check "util-linux" "CPU, storage, fstab, and kernel-log commands" lscpu lsblk findmnt dmesg
+    requirement_check "iproute2" "network interfaces, routes, and sockets" ip ss
+    printf '\nHardware details (optional, hardware-dependent):\n'
+    requirement_check "pciutils" "PCI devices and drivers" lspci
+    requirement_check "usbutils" "USB device names and bus tree" lsusb
+    requirement_check "dmidecode" "memory modules, motherboard, BIOS/SMBIOS" dmidecode
+    requirement_optional_check "kmod" "formatted loaded-module list; /proc/modules is a fallback" lsmod
+    requirement_check "smartmontools" "SMART health data" smartctl
+    requirement_check "lm_sensors" "temperature and sensor readings" sensors
+    requirement_check "alsa-utils" "audio-device enumeration" aplay
+    requirement_check "libinput" "detailed input-device enumeration" libinput
+    printf '\nOptional network, firewall, and firmware details:\n'
+    requirement_check "NetworkManager" "NetworkManager state and devices" nmcli
+    requirement_check "iw" "wireless-device details" iw
+    requirement_any_check "iptables or nftables" "firewall rules" iptables nft
+    requirement_check "efibootmgr" "UEFI boot entries (UEFI systems only)" efibootmgr
+    requirement_check "openssh" "SSH server configuration and effective settings" sshd ssh-keygen
+    printf '\nSome results also require root privileges. Sensor data depends on supported hardware and kernel drivers.\n'
+    printf 'Module information can still be read from /proc/modules when lsmod is absent.\n'
+}
+package_missing_files() {
+    local f n checked=0 missing=0
+    local missingfile="$TMPDIR_AUDIT/missing-paths"; : > "$missingfile"
+    section_title "Missing paths from package manifests"
+    if [[ ! -d "$PACKAGE_LOG_DIR" ]]; then printf 'Package database directory not found: %s\n' "$PACKAGE_LOG_DIR"; return; fi
+    shopt -s nullglob; local files=("$PACKAGE_LOG_DIR"/*); shopt -u nullglob
+    for f in "${files[@]}"; do
+        [[ -f "$f" ]] || continue
+        while IFS= read -r n; do
+            [[ -n "$n" ]] || continue; [[ "$n" == install/* || "$n" == ./install/* ]] && continue
+            case "$n" in ./*) n=${n#./} ;; esac; [[ "$n" == /* ]] || n="/$n"; ((checked+=1))
+            if [[ ! -e "$n" && ! -L "$n" ]]; then ((missing+=1)); ((missing <= 200)) && printf '%s: %s\n' "$(basename "$f")" "$n" >> "$missingfile"; fi
+        done < <(awk 'BEGIN{list=0} /^FILE LIST:/{list=1; next} list{print}' "$f")
+    done
+    printf 'Entries checked: %s\nMissing paths: %s\n' "$checked" "$missing"
+    if ((missing)); then printf '\nFirst missing paths (maximum 200):\n'; cat "$missingfile"; fi
+    printf '\nThis check does not compare file contents or hashes.\n'
+}
+storage_mounts() { section_title "Mounted filesystems"; if have findmnt; then findmnt -r -o TARGET,SOURCE,FSTYPE,OPTIONS 2>&1 | redact; else print_cmd df -hT; fi; }
+storage_fstab() { section_title "/etc/fstab"; if [[ -r /etc/fstab ]]; then awk '!/^[[:space:]]*#/ && NF' /etc/fstab | redact; else printf '/etc/fstab unavailable.\n'; fi; if have findmnt; then printf '\nValidation:\n'; findmnt --verify --verbose --tab-file /etc/fstab 2>&1 | redact; fi; }
+storage_usage() { section_title "Filesystem capacity and inodes"; print_cmd df -hT; printf '\nInodes:\n'; print_cmd df -hi; }
+storage_smart() {
+    local device type result="$TMPDIR_AUDIT/smartctl.out" count=0 rc
+    section_title "SMART health checks"
+    if ! have smartctl; then printf 'smartmontools (smartctl) is not installed. Install it to query disk health.\n'; return; fi
+    if [[ $EUID -ne 0 ]]; then printf 'Run as root to query SMART status for all detected disks.\n'; return; fi
+    if ! have lsblk; then printf 'util-linux (lsblk) is required to safely identify whole-disk devices.\n'; return; fi
+    while read -r device type; do
+        [[ "$type" == disk && -b "$device" ]] || continue
+        ((count+=1))
+        printf '\n--- %s ---\n' "$device"
+        if have timeout; then timeout 20s smartctl -H "$device" > "$result" 2>&1; rc=$?
+        else smartctl -H "$device" > "$result" 2>&1; rc=$?; fi
+        redact < "$result"
+        case $rc in
+            0) : ;;
+            124) printf 'Query timed out after 20 seconds.\n' ;;
+            *) printf 'smartctl returned status %s. The health result above may still be valid; check smartctl documentation for device-specific status details.\n' "$rc" ;;
+        esac
+    done < <(lsblk -dnpo NAME,TYPE 2>/dev/null)
+    if ((count == 0)); then printf 'No whole-disk block devices were detected by lsblk.\n'; fi
+    printf '\nThis runs a read-only health query (-H); it does not start a self-test.\n'
+}
+boot_kernel() { section_title "Running kernel and boot parameters"; uname -a; printf '\nKernel command line:\n'; if [[ -r /proc/cmdline ]]; then cat /proc/cmdline | redact; else printf 'unavailable\n'; fi; }
+boot_files() { section_title "Files in /boot"; if [[ -d /boot ]]; then ls -lah /boot 2>&1 | redact; else printf '/boot not found.\n'; fi; }
+boot_loader() {
+    local efivar current entry loader_path manager="" f found=0 efi_file_re='File\(([^)]*)\)'
+    section_title "Boot manager in use"
+    if [[ -d /sys/firmware/efi ]]; then
+        printf 'Firmware mode: UEFI\n'
+        if have efibootmgr; then
+            efivar=$(efibootmgr -v 2>&1)
+            current=$(printf '%s\n' "$efivar" | sed -n 's/^BootCurrent: //p' | head -n 1)
+            if [[ -n "$current" ]]; then
+                entry=$(printf '%s\n' "$efivar" | grep -i "^Boot${current}[^:]*:" | head -n 1)
+                printf 'Active firmware entry: %s\n' "${entry:-Boot$current (entry details unavailable)}" | redact
+                if [[ "$entry" =~ $efi_file_re ]]; then loader_path=${BASH_REMATCH[1]}; fi
+                case "${loader_path,,}" in
+                    *grub*.efi*) manager=GRUB ;;
+                    *elilo*.efi*) manager=ELILO ;;
+                    *systemd-boot*.efi*|*systemd*.efi*) manager="systemd-boot" ;;
+                    *refind*.efi*) manager=rEFInd ;;
+                    *shim*.efi*) manager="shim (chain-loaded manager not identified from BootCurrent)" ;;
+                    *lilo*.efi*) manager=LILO ;;
+                esac
+                [[ -n "$loader_path" ]] && printf 'Active EFI program: %s\n' "$loader_path" | redact
+            else
+                printf 'efibootmgr did not report BootCurrent; active manager could not be determined.\n'
+            fi
+        else
+            printf 'Install efibootmgr and run as root to identify the active UEFI boot entry.\n'
+        fi
+    else
+        printf 'Firmware mode: BIOS/Legacy\n'
+        printf 'BIOS does not expose the active boot manager to the running OS through a standard interface.\n'
+        printf 'Configuration files below are candidates and do not prove which manager booted this system.\n'
+    fi
+
+    if [[ "$manager" == "GRUB" ]]; then
+        printf '\nConfiguration for the active manager (GRUB):\n'
+        for f in /boot/grub/grub.cfg /boot/grub2/grub.cfg /boot/efi/EFI/Slackware/grub.cfg /boot/efi/EFI/slackware/grub.cfg /etc/default/grub; do
+            [[ -r "$f" ]] || continue; found=1; printf '\n--- %s ---\n' "$f"
+            grep -E '^[[:space:]]*(menuentry|submenu|linux|linuxefi|initrd|initrdefi|GRUB_DEFAULT|GRUB_TIMEOUT|GRUB_CMDLINE_LINUX|GRUB_DISABLE_OS_PROBER)' "$f" | head -n 200 | redact
+        done
+        ((found)) || printf 'GRUB is the active EFI program, but its configuration file was not found at the usual paths.\n'
+    elif [[ "$manager" == "ELILO" ]]; then
+        for f in /etc/elilo.conf /boot/efi/EFI/Slackware/elilo.conf /boot/efi/EFI/slackware/elilo.conf; do
+            [[ -r "$f" ]] || continue; found=1; printf '\n--- %s ---\n' "$f"; awk '!/^[[:space:]]*#/ && NF' "$f" | redact
+        done
+        ((found)) || printf 'ELILO is active, but its configuration file was not found at the usual paths.\n'
+    elif [[ "$manager" == "systemd-boot" ]]; then
+        for f in /boot/loader/loader.conf /boot/efi/loader/loader.conf /boot/loader/entries/*.conf /boot/efi/loader/entries/*.conf; do
+            [[ -r "$f" ]] || continue; found=1; printf '\n--- %s ---\n' "$f"; awk '!/^[[:space:]]*#/ && NF' "$f" | redact
+        done
+        ((found)) || printf 'systemd-boot is active, but loader configuration files were not found at the usual paths.\n'
+    elif [[ "$manager" == "rEFInd" ]]; then
+        for f in /boot/EFI/BOOT/refind.conf /boot/efi/EFI/BOOT/refind.conf /boot/efi/EFI/refind/refind.conf /boot/refind_linux.conf; do
+            [[ -r "$f" ]] || continue; found=1; printf '\n--- %s ---\n' "$f"; awk '!/^[[:space:]]*#/ && NF' "$f" | head -n 200 | redact
+        done
+        ((found)) || printf 'rEFInd is active, but its configuration file was not found at the usual paths.\n'
+    elif [[ -n "$manager" ]]; then
+        printf '\nActive manager: %s. Its configuration could not be mapped automatically.\n' "$manager"
+        printf 'EFI loader path: %s\n' "${loader_path:-unknown}"
+    elif [[ ! -d /sys/firmware/efi ]]; then
+        for f in /boot/grub/grub.cfg /boot/grub2/grub.cfg /etc/lilo.conf /etc/elilo.conf; do
+            [[ -r "$f" ]] || continue; printf '\n--- candidate: %s ---\n' "$f"
+            grep -E '^[[:space:]]*(image|initrd|root|append|label|menuentry|submenu|linux|linuxefi|timeout|default)' "$f" | head -n 160 | redact
+        done
+    fi
+}
+boot_uefi() { section_title "UEFI boot entries"; if [[ ! -d /sys/firmware/efi ]]; then printf 'System does not appear to be booted in UEFI mode.\n'; elif have efibootmgr && [[ $EUID -eq 0 ]]; then efibootmgr -v 2>&1 | redact; else printf 'Install efibootmgr and run as root to inspect UEFI entries.\n'; fi; }
+network_interfaces() { section_title "Network interfaces and addresses"; if have ip; then ip -details address 2>&1 | redact; else printf 'iproute2 is not installed.\n'; fi; }
+network_routes() { section_title "Network routes"; if have ip; then ip route show table all 2>&1 | redact; else printf 'iproute2 is not installed.\n'; fi; }
+network_dns() { section_title "DNS configuration"; if [[ -r /etc/resolv.conf ]]; then cat /etc/resolv.conf | redact; else printf '/etc/resolv.conf unavailable.\n'; fi; if have nmcli; then printf '\nNetworkManager DNS:\n'; nmcli device show 2>&1 | grep -E 'GENERAL.DEVICE|IP[46].DNS|IP[46].DOMAIN' | redact; fi; }
+network_wireless() { section_title "Wireless devices"; if have iw; then iw dev 2>&1 | redact; else printf 'iw is not installed.\n'; fi; if have nmcli; then printf '\nNetworkManager device status:\n'; nmcli device status 2>&1 | redact; fi; }
+network_sockets() { section_title "Listening network sockets"; if have ss; then ss -lntup 2>&1 | redact; elif have netstat; then netstat -lntup 2>&1 | redact; else printf 'Install iproute2 (ss) or net-tools (netstat).\n'; fi; }
+services_rc() { local f; section_title "Slackware startup scripts"; if [[ -d /etc/rc.d ]]; then for f in /etc/rc.d/rc.*; do [[ -f "$f" ]] || continue; if [[ -x "$f" ]]; then printf 'enabled  %s\n' "$f"; else printf 'disabled %s\n' "$f"; fi; done; else printf '/etc/rc.d not found.\n'; fi; }
+services_processes() { section_title "Running processes"; if have ps; then ps -eo user,pid,ppid,stat,%cpu,%mem,comm,args --sort=-%cpu 2>&1 | head -n 200 | redact; else printf 'ps is unavailable.\n'; fi; }
+services_sockets() { network_sockets; }
+security_accounts() { section_title "Local users and groups"; [[ -r /etc/passwd ]] && awk -F: '$3==0 || $3>=1000 {printf "%-20s uid=%-6s gid=%-6s home=%s shell=%s\n",$1,$3,$4,$6,$7}' /etc/passwd; printf '\nAdministrative groups:\n'; [[ -r /etc/group ]] && grep -E '^(wheel|sudo|root):' /etc/group || true; }
+security_permissions() { local f; section_title "Sensitive file permissions"; for f in /etc/passwd /etc/shadow /etc/group /etc/sudoers /etc/ssh/sshd_config; do [[ -e "$f" ]] && stat -c '%A %a %U:%G %n' "$f" 2>&1; done; }
+security_ssh() {
+    local config=/etc/ssh/sshd_config effective="$TMPDIR_AUDIT/sshd-effective.out" test_key="$TMPDIR_AUDIT/sshd-audit-hostkey"
+    section_title "SSH server configuration"
+    if ! have sshd; then printf 'OpenSSH server command (sshd) is not installed. Install the Slackware openssh package to audit server settings.\n'; return; fi
+    printf 'OpenSSH server command: %s\n' "$(command -v sshd)"
+    if [[ -x /etc/rc.d/rc.sshd ]]; then printf 'Slackware rc.sshd: enabled (executable)\n'; elif [[ -e /etc/rc.d/rc.sshd ]]; then printf 'Slackware rc.sshd: disabled (not executable)\n'; else printf 'Slackware rc.sshd: script not found\n'; fi
+    if have pgrep && pgrep -a sshd 2>/dev/null; then :; else printf 'Running sshd process: not detected\n'; fi
+    if [[ ! -r "$config" ]]; then printf '\nServer configuration file not readable: %s\n' "$config"; return; fi
+    printf '\nConfigured directives and include statements:\n'
+    grep -E -i '^[[:space:]]*(Include|Port|ListenAddress|AddressFamily|PermitRootLogin|PasswordAuthentication|PubkeyAuthentication|KbdInteractiveAuthentication|PermitEmptyPasswords|AllowUsers|AllowGroups|DenyUsers|DenyGroups|AuthenticationMethods|MaxAuthTries|X11Forwarding|AllowTcpForwarding|UsePAM)[[:space:]]' "$config" | redact || printf 'No explicit matching directives; daemon defaults may apply.\n'
+    if have sshd; then
+        # sshd -T refuses to run without host keys. Create a disposable key
+        # inside the private audit temp directory; never write to /etc/ssh.
+        if have ssh-keygen && ssh-keygen -q -t ed25519 -N '' -f "$test_key" >/dev/null 2>&1; then
+            if sshd -T -f "$config" -o "HostKey=$test_key" > "$effective" 2>&1; then
+                printf '\nEffective global settings from sshd -T:\n'
+                grep -E -i '^(port|addressfamily|listenaddress|permitrootlogin|passwordauthentication|pubkeyauthentication|kbdinteractiveauthentication|permitemptypasswords|allowusers|allowgroups|denyusers|denygroups|authenticationmethods|maxauthtries|x11forwarding|allowtcpforwarding|usepam) ' "$effective" | redact
+            else
+                printf '\nCould not calculate effective settings with sshd -T:\n'; cat "$effective" | redact
+            fi
+        elif sshd -T -f "$config" > "$effective" 2>&1; then
+            printf '\nEffective global settings from sshd -T:\n'
+            grep -E -i '^(port|addressfamily|listenaddress|permitrootlogin|passwordauthentication|pubkeyauthentication|kbdinteractiveauthentication|permitemptypasswords|allowusers|allowgroups|denyusers|denygroups|authenticationmethods|maxauthtries|x11forwarding|allowtcpforwarding|usepam) ' "$effective" | redact
+        else
+            printf '\nCould not calculate effective settings with sshd -T:\n'; cat "$effective" | redact
+        fi
+    fi
+    printf '\nsshd -T reports global defaults. Match blocks can change settings for a particular user, host, or address.\n'
+}
+security_firewall() { section_title "Firewall rules"; if have nft; then nft list ruleset 2>&1 | redact; elif have iptables; then iptables -S 2>&1 | redact; else printf 'Install nftables or iptables to inspect firewall rules.\n'; fi; }
+categorize_log_file() {
+    local input=$1 tagged="$TMPDIR_AUDIT/tagged.log" category count
+    awk '
+        {
+            line = tolower($0)
+            if (line ~ /(^|[^[:alpha:]])(error|failed|failure|critical|crit:|panic|fatal|alert|emerg|segfault|oops|bug:|i\/o error|not found|not ready|not loaded|unable to|cannot|no such device)([^[:alpha:]]|$)/) { print "ERROR    " $0; next }
+            if (line ~ /warn(ing)?|degraded|timed out|timeout|retry|overheat|throttl/) { print "WARNING  " $0; next }
+            if (line ~ /(^|[^[:alnum:]])(ok|success(fully)?|started|ready|loaded|initialized|mounted)([^[:alnum:]]|$)/) { print "OK       " $0; next }
+            print "INFO     " $0
+        }
+    ' "$input" > "$tagged"
+    for category in ERROR WARNING OK INFO; do
+        count=$(grep -c "^${category}[[:space:]]" "$tagged" 2>/dev/null || true)
+        printf '\n%s messages: %s\n' "$category" "${count:-0}"
+        if ((count > 0)); then grep "^${category}[[:space:]]" "$tagged" | tail -n 50 | redact; fi
+    done
+}
+logs_kernel() {
+    local raw="$TMPDIR_AUDIT/kernel-log.raw"
+    section_title "Kernel messages by category"
+    if ! have dmesg; then printf 'dmesg is unavailable. Install util-linux.\n'; return; fi
+    if ! dmesg -T > "$raw" 2>&1; then printf 'Kernel buffer was not readable; run as root. Diagnostic:\n'; sed -n '1,5p' "$raw" | redact; return; fi
+    printf 'Reviewing the current kernel buffer. Up to 50 recent lines per category are shown.\n'
+    categorize_log_file "$raw"
+}
+logs_files() {
+    local f raw="$TMPDIR_AUDIT/system-log.raw" found=0
+    section_title "System log messages by category"
+    for f in /var/log/messages /var/log/syslog /var/log/boot.log /var/log/secure /var/log/maillog /var/log/cron /var/log/debug; do
+        [[ -r "$f" ]] || continue
+        found=1
+        printf '\n--- %s (last 1000 lines, categorized) ---\n' "$f"
+        tail -n 1000 "$f" > "$raw"
+        categorize_log_file "$raw"
+    done
+    ((found)) || printf 'No supported readable log files found.\n'
+}
+
+make_report() {
+    local dest=$1 dir
+    dir=${dest%/*}
+    [[ "$dir" == "$dest" ]] && dir=.
+    [[ -d "$dir" ]] || { printf 'Directory not found: %s\n' "$dir" >&2; return 1; }
+    [[ ! -e "$dest" || $FORCE -eq 1 ]] || { printf 'File already exists; use --force: %s\n' "$dest" >&2; return 1; }
+    {
+        printf 'slackaudit %s - local audit report\n' "$VERSION"
+        printf 'Generated at: %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')"
+        printf 'Read-only report; may contain local information.\n\n'
+        audit_summary
+        system_overview
+        hardware_all
+        package_audit
+        package_list
+        requirements_audit
+        storage_audit
+        boot_audit
+        network_audit
+        services_audit
+        security_audit
+        logs_audit
+    } > "$dest" 2>&1
+    chmod 600 "$dest" 2>/dev/null || true
+    printf 'Report written: %s\n' "$dest"
+}
+
+if [[ -n "$REPORT_FILE" ]]; then
+    if [[ $EUID -ne 0 ]]; then printf 'slackaudit: running without root; some report sections may be incomplete.\n' >&2; fi
+    make_report "$REPORT_FILE"; exit $?
+fi
+
+show_section() {
+    local title=$1 fn=$2 file="$TMPDIR_AUDIT/view.txt"
+    : > "$file"
+    "$fn" > "$file" 2>&1
+    "$DIALOG_BIN" --clear --backtitle "$PROGRAM $VERSION - read-only audit" \
+        --title "$title" --textbox "$file" 27 96
+}
+
+run_submenu() {
+    local title=$1; shift
+    local -a entries=("$@")
+    local choice prompt="Select a topic. Press Escape to return."
+    while :; do
+        choice=$("$DIALOG_BIN" --clear --backtitle "$PROGRAM $VERSION" --title "$title" --menu "$prompt" 20 86 12 "${entries[@]}" 3>&1 1>&2 2>&3) || return
+        case "$choice" in
+            cpu) show_section "CPU" hardware_cpu ;; pci) show_section "PCI devices" hardware_pci ;; usb) show_section "USB devices" hardware_usb ;;
+            mem) show_section "Memory" hardware_memory ;; board) show_section "Motherboard and firmware" hardware_board ;;
+            graphics) show_section "Graphics" hardware_graphics ;; audio) show_section "Audio" hardware_audio ;;
+            input) show_section "Input devices" hardware_input ;; sensors) show_section "Sensors" hardware_sensors ;;
+            modules) show_section "Loaded kernel modules" hardware_modules ;;
+            netadapters) show_section "Network adapters" hardware_network ;; hwall) show_section "Full hardware inventory" hardware_all ;;
+            pkgsummary) show_section "Package summary" package_summary ;; pkgthirdparty) show_section "Likely third-party packages" package_third_party ;; pkglist) show_section "Installed package list" package_list ;;
+            pkgmissing) "$DIALOG_BIN" --infobox "Checking all package manifests. This may take several minutes." 6 76; show_section "Missing package paths" package_missing_files ;;
+            disks) show_section "Disks and partitions" hardware_storage ;; mounts) show_section "Mounted filesystems" storage_mounts ;;
+            fstab) show_section "/etc/fstab" storage_fstab ;; usage) show_section "Filesystem capacity" storage_usage ;; smart) show_section "SMART information" storage_smart ;;
+            kernel) show_section "Kernel and parameters" boot_kernel ;; bootfiles) show_section "Files in /boot" boot_files ;;
+            loader) show_section "Bootloader configuration" boot_loader ;; uefi) show_section "UEFI entries" boot_uefi ;;
+            interfaces) show_section "Interfaces and addresses" network_interfaces ;; routes) show_section "Routes" network_routes ;;
+            dns) show_section "DNS configuration" network_dns ;; wireless) show_section "Wireless devices" network_wireless ;; sockets) show_section "Listening sockets" network_sockets ;;
+            rc) show_section "Startup scripts" services_rc ;; processes) show_section "Running processes" services_processes ;;
+            accounts) show_section "Accounts and groups" security_accounts ;; permissions) show_section "Sensitive file permissions" security_permissions ;;
+            ssh) show_section "SSH configuration" security_ssh ;; firewall) show_section "Firewall rules" security_firewall ;;
+            kernellogs) show_section "Kernel messages" logs_kernel ;; syslogs) show_section "System log files" logs_files ;;
+        esac
+    done
+}
+hardware_menu() { run_submenu "Hardware inventory" cpu "CPU details" mem "Memory and modules" board "Motherboard and BIOS" modules "Loaded kernel modules" pci "PCI devices and drivers" usb "USB devices" graphics "Graphics controller" audio "Audio devices" input "Input devices" sensors "Sensors and temperatures" netadapters "Network adapters" hwall "Complete hardware report"; }
+packages_menu() { run_submenu "Package information" pkgsummary "Package count and duplicate versions" pkgthirdparty "Likely third-party packages" pkglist "Complete installed package list" pkgmissing "Missing manifest paths"; }
+storage_menu() { run_submenu "Storage" disks "Disks and partitions" mounts "Mounted filesystems" fstab "fstab entries and validation" usage "Capacity and inode usage" smart "SMART health support"; }
+boot_menu() { run_submenu "Boot information" kernel "Running kernel and parameters" bootfiles "Files in /boot" loader "Bootloader configuration" uefi "UEFI boot entries"; }
+network_menu() { run_submenu "Network information" interfaces "Interfaces and addresses" routes "Routing tables" dns "DNS configuration" wireless "Wireless and NetworkManager" sockets "Listening sockets"; }
+services_menu() { run_submenu "Services and processes" rc "Slackware startup scripts" processes "Running processes" sockets "Listening sockets"; }
+security_menu() { run_submenu "Local security configuration" accounts "Users and administrative groups" permissions "Sensitive file permissions" ssh "SSH server settings" firewall "Firewall rules"; }
+logs_menu() { run_submenu "Logs and diagnostics" kernellogs "Kernel messages" syslogs "System log files"; }
+
+export_dialog() {
+    local dest
+    dest=$("$DIALOG_BIN" --clear --title "Save report" --inputbox \
+        "Enter a path. The report may contain hostnames, IP addresses, and local log excerpts." \
+        10 76 "$HOME/slackaudit-$(date +%Y%m%d-%H%M%S).txt" 3>&1 1>&2 2>&3) || return
+    [[ -n "$dest" ]] || return
+    if [[ -e "$dest" ]]; then "$DIALOG_BIN" --yesno "The file already exists. Overwrite it?" 7 60 || return; FORCE=1; fi
+    if make_report "$dest" > "$TMPDIR_AUDIT/export-result.txt" 2>&1; then
+        "$DIALOG_BIN" --title "Report complete" --textbox "$TMPDIR_AUDIT/export-result.txt" 8 76
+    else
+        "$DIALOG_BIN" --title "Report generation failed" --textbox "$TMPDIR_AUDIT/export-result.txt" 10 76
+    fi
+}
+
+main_menu() {
+    local choice
+    while :; do
+        choice=$("$DIALOG_BIN" --clear --backtitle "$PROGRAM $VERSION - inventory and local audit" \
+            --title "slackaudit" \
+            --menu "Choose a section. Collection does not change system settings." 20 84 12 \
+            audit "Local audit summary" \
+            requirements "Required tools and packages" \
+            overview "System overview" \
+            hardware "Hardware inventory" \
+            packages "Installed packages" \
+            storage "Storage and filesystems" \
+            boot "Boot and kernel" \
+            network "Network configuration" \
+            services "Services and processes" \
+            security "Local security configuration" \
+            logs "Logs and diagnostics" \
+            export "Write complete text report" \
+            3>&1 1>&2 2>&3) || break
+        case "$choice" in
+            audit) show_section "Local audit summary" audit_summary ;;
+            requirements) show_section "Required and optional packages" requirements_audit ;;
+            overview) show_section "System overview" system_overview ;;
+            hardware) hardware_menu ;;
+            packages) packages_menu ;;
+            storage) storage_menu ;;
+            boot) boot_menu ;;
+            network) network_menu ;;
+            services) services_menu ;;
+            security) security_menu ;;
+            logs) logs_menu ;;
+            export) export_dialog ;;
+        esac
+    done
+    "$DIALOG_BIN" --clear
+}
+if [[ $EUID -ne 0 ]]; then
+    "$DIALOG_BIN" --yesno "For the most complete audit, run as root (for example, sudo slackaudit). Continue with limited access?" 9 76 || exit 0
+fi
+main_menu
